@@ -11,6 +11,8 @@ IRC ライクな TCP 行ベースのコミュニケーションリレーです�
 - タスク管理なし — 引継ぎは自然言語サマリと status 更新で
 - 認証・暗号なし — 隠したい情報は MixedRelay に載せない
 
+![screenshot](docs/screenshot.png)
+
 ---
 
 ## Architecture
