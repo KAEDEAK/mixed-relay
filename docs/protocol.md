@@ -210,6 +210,25 @@ S: :server MRARCHIVE #<ch> END :<count>
 
 ---
 
+## 10.5 Channel reset (F-13)
+
+```
+C: MRPURGE #<ch>
+S: :<nick>!<user>@host MRPURGE #<ch>             (broadcast to channel members, EXCEPT caller)
+S: :server MRPURGE #<ch> DONE :<count>           (reply to caller only)
+```
+
+- channel を完全に初期状態へリセット (active log / 全 read cursor / archive segments を破棄)
+- `topic` と現在のメンバーシップは保持
+- リセット後の次の発言は `seq = 1` から再採番される (F-7.3 の単調性は purge を境に reset)
+- `<count>` は削除した entry の合計 (active + archive)
+- 取消・partial purge は提供しない
+- 権限制限なし (運用合意で制御)
+- broadcast は caller を除外する (caller は DONE で結果を知る)。これにより既存クライアントの
+  「MRPURGE 送信→DONE 受信」同期パターンは無変更で動作する
+
+---
+
 ## 11. Liveness (F-11)
 
 ```

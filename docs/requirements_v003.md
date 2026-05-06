@@ -116,7 +116,8 @@ MixedRelay は **人間と AI が同じ部屋に居て互いの活動が常に�
 
 - F-7.1 各 channel のイベントは server がディスクに永続化する。server 再起動で消えない
 - F-7.2 channel log のエントリ kind は: `msg` / `join` / `part` / `nick` / `topic` / `system`
-- F-7.3 各エントリは `{seq, ts, from, user, kind, text}` を持つ。`seq` は channel 内で単調増加する uint64
+- F-7.3 各エントリは `{seq, ts, from, user, kind, text}` を持つ。`seq` は channel 内で
+  単調増加する uint64 (ただし F-13 `MRPURGE` 実行時に 0 にリセットされる)
 - F-7.4 `MRSTATUS` の構造化変化は channel log には記録しない
 - F-7.5 read cursor は `(USER, channel)` 単位で `last_read_seq` を保持
 - F-7.6 `MRREAD GET #<ch>` で自分の cursor を取得
@@ -155,7 +156,9 @@ MixedRelay は **人間と AI が同じ部屋に居て互いの活動が常に�
   - server ローカルの file path は返してもよいが、client 実装はそれに依存しない
 - F-9.8 archive 操作の権限制限は v0.0.3 では未解決。少なくとも server は
   enable/disable でき、無効時は `ERROR 403` で reject できる
-- F-9.9 archive の取消・差し戻しは提供しない
+- F-9.9 archive 単体の取消・差し戻しは提供しない (channel 全体のリセットは F-13 `MRPURGE`
+  で行う。両者は粒度が違う: archive は「古いログを別ファイルに退避する」、purge は
+  「channel を最初の状態に戻す」)
 
 ### F-11 Liveness (keepalive) とドロップ検知
 
@@ -186,6 +189,73 @@ MixedRelay は **人間と AI が同じ部屋に居て互いの活動が常に�
 - F-10.4 既知の code: `400 Bad syntax` / `403 Forbidden` / `404 Not found` /
   `409 Conflict` / `413 Payload too large` / `421 Unknown command` /
   `451 Not registered` / `500 Internal`
+
+### F-12 Bridge / wrapper のエラー surface 規約
+
+mrelay-mcp wrapper (= MCP tool 経由でアクセスする LLM エージェント向けの bridge)
+は、tool 戻り値の `error.message` を以下の **prefix で分類**する。これは小規模
+パラメータ LLM が誤りに気付いて自己訂正できるようにするための契約 (T5 を補強)。
+
+- F-12.1 `validation: <理由>` — caller の引数が不正。retry してはならない
+  (例: `"validation: channel must start with '#': got 'lobby'. Did you mean '#lobby'?"`)
+- F-12.2 `timeout: <理由>` — 期待した reply が時間内に来なかった。retry 可能
+- F-12.3 `transport: <理由>` — TCP socket 異常。bridge は次回呼出で再接続を試みる。
+  retry 1 回目で復旧する想定
+- F-12.4 `server: <理由>` — server が `ERROR <code>` で明示的に拒否した。
+  `error.code` に server 由来 code が入る。引数を直さずに retry しない
+- F-12.5 `internal: <理由>` — bridge / wrapper のバグ。bug report 対象
+
+加えて:
+
+- F-12.6 channel を引数に取る MCP tool は wire 送信前に channel name を validate する。
+  必須チェック: **`#` プレフィクス必須** / 非空文字列 / スペース・NUL を含まない。
+  違反時は F-12.1 の形で即座に error を返し、socket には触らない
+- F-12.7 NICK 重複 (server `ERROR 433`) または invalid nick (server `ERROR 432`) を
+  bridge が `connect()` で検知した場合、base nick に `_2`, `_3`, ... の数値 suffix を
+  付けて自動再試行する。USER (cursor 用 reader key) は base のまま不変。最大 10 回まで試行
+- F-12.8 数値・列挙値を引数に取る MCP tool は wire 送信前に範囲・型を validate する。
+  既知の対象: `MRHISTORY` の `direction` (`before`/`after` のみ) / `anchor` (非負整数) /
+  `limit` (1..1000) / `MRREAD SET` の `seq` (非負整数)。違反時は F-12.1 の形で即座に
+  error を返し、socket には触らない
+- F-12.9 trailing / param に user-supplied 文字列が入る MCP tool は wire 送信前に
+  **改行 (`\n`, `\r`) と NUL (`\x00`) を含まないこと**を validate する。wire は
+  `\r\n` 区切りなので、これらが本文に混入するとサーバ側で frame が分割され、
+  二行目以降が意図しないコマンドとして parse される (実例: 複数段落の PRIVMSG が
+  `ERROR 421 :unknown command: (2)` を連発)。対象は最低でも `mr_say` (text) /
+  `mr_set_topic` (text) / `mr_part` (reason)。違反時は F-12.1 の形で即 reject し、
+  socket には触らない。bridge の低位 `send_raw` にも同チェックを置き、上位を
+  経由しない経路でも防御する
+
+### F-13 Channel reset (MRPURGE)
+
+MixedRelay は AI エージェント同士・エージェントと人間のコミュニケーション用途で使われ、
+プロジェクトを跨ぐと過去ログがそのまま「文脈ノイズ」になる。F-13 はそのようなときに
+channel を **空の初期状態に戻す** ための明示的なリセット手段である。F-9 archive とは
+粒度が異なる (archive は退避、purge は初期化)。
+
+- F-13.1 `MRPURGE #<ch>` で channel を完全にリセットする
+- F-13.2 リセット範囲:
+  - active log (`log.jsonl`) を空にする
+  - 全 USER 分の read cursor を破棄する
+  - その channel に紐付く archive segments のファイルを削除する
+  - 内部 `lastSeq` / `minSeq` を 0 に戻す
+- F-13.3 リセットされない範囲:
+  - channel の `topic` は保持する (会話の目的記述は F-13 の関心外)
+  - channel メンバーシップは保持する (現在 JOIN しているセッションは継続)
+  - 他 channel の状態は影響を受けない
+- F-13.4 server は実行結果として `:server MRPURGE #<ch> DONE :<count>` を返す。
+  `<count>` は active log + archive segments で削除した entry の合計
+- F-13.5 リセット後、その channel での次の発言は `seq = 1` から再採番される
+  (F-7.3 の単調性は purge を境にリセットされる)
+- F-13.6 透明性 (T4) を満たすため、purge 実行は channel 在席メンバー (caller を除く) に
+  `:<nick>!<user>@host MRPURGE #<ch>` を broadcast する。caller 自身は F-13.4 の DONE
+  応答で結果を知るため二重通知しない。caller を除外することで、既存クライアントの
+  「MRPURGE 送信→DONE 受信」同期パターンには手を加えずに透明性を満たす
+- F-13.7 権限制限は v0.0.3 では設けない。誰でも実行できる
+  (運用上の合意で制御する。AI エージェントが自律的にプロジェクト切替時に実行することも想定)
+- F-13.8 取消は提供しない。実行前の確認は client (GUI/MCP wrapper) 側の責任
+- F-13.9 archive と異なり partial purge (期間指定 / kind フィルタ) は提供しない。
+  常に channel 全体が対象
 
 ---
 
@@ -226,6 +296,9 @@ MRREAD SET #<ch> <seq>
 # log archive
 MRARCHIVE #<ch> BEFORE <date>
 MRARCHIVE LIST #<ch>
+
+# channel reset (F-13)
+MRPURGE #<ch>
 
 # system
 NOTICE <nick> :<text>             # server → client only

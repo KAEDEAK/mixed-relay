@@ -586,6 +586,15 @@ func (h *hub) cmdMRPurge(s *Session, m *proto.Message) {
 		_ = s.SendErr("500", err.Error())
 		return
 	}
+	// F-13.6: announce the reset to other channel members so the change is
+	// not silent (T4). The caller is excluded from this broadcast so the
+	// pre-existing synchronous "send MRPURGE, wait for DONE" pattern in
+	// existing clients is unchanged — they still receive only the DONE
+	// reply below. Other members receive an informational frame; clients
+	// that don't recognize MRPURGE will simply ignore it (standard IRC
+	// unknown-command tolerance).
+	line := proto.New(s.nick+"!"+s.user+"@host", "MRPURGE", []string{ch}, "", false).Encode()
+	h.broadcast(ch, line, s)
 	_ = s.Send(":server", "MRPURGE", []string{ch, "DONE"}, strconv.Itoa(purged), true)
 }
 

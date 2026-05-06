@@ -16,7 +16,59 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .client import BrokenConnection, MixedRelayClient, RemoteError
+from .client import (
+    BrokenConnection,
+    MixedRelayClient,
+    RemoteError,
+    TimeoutWaiting,
+    ValidationError,
+)
+
+
+def _validate_channel(channel: str) -> None:
+    """Reject malformed channel names BEFORE sending anything to the wire.
+
+    The leading '#' is the most common drop — see the dev note about a
+    small-parameter LLM repeatedly calling mr_history(channel='lobby') and
+    then misreading the resulting 5-second timeout as 'no new messages'.
+    Catching it here returns an immediate, action-guiding error so the LLM
+    can self-correct on the next turn.
+    """
+    if not isinstance(channel, str) or not channel:
+        raise ValidationError("channel must be a non-empty string")
+    if not channel.startswith("#"):
+        raise ValidationError(
+            f"channel must start with '#': got {channel!r}. "
+            f"Did you mean '#{channel}'?"
+        )
+    if " " in channel or "\x00" in channel:
+        raise ValidationError(
+            f"channel must not contain spaces or NUL: got {channel!r}"
+        )
+
+
+def _validate_user_text(text: str, label: str = "text") -> None:
+    """Reject user-supplied text that would corrupt the line-based wire frame.
+
+    The wire is ``\\r\\n``-delimited; a ``\\n`` (or NUL) inside a PRIVMSG /
+    TOPIC body splits the frame on the wire so the server treats each
+    subsequent paragraph as a fresh command — observed in practice as a
+    cascade of ``ERROR 421 :unknown command: (2)`` etc. when an LLM tried to
+    send a multi-paragraph message. We catch it here so the LLM gets a
+    ``validation: ...`` reply instead of a confusing partial-success.
+
+    Empty string is allowed (TOPIC clear, PART without reason, etc.).
+    """
+    if not isinstance(text, str):
+        raise ValidationError(f"{label} must be a string")
+    for ch, name in (("\n", "newline"), ("\r", "carriage return"), ("\x00", "NUL")):
+        if ch in text:
+            raise ValidationError(
+                f"{label} must not contain {name}; the wire is line-delimited so "
+                f"embedded line terminators split your message into multiple frames "
+                f"and the second one is parsed as an unknown command. "
+                f"Replace newlines with spaces or send each line as a separate call."
+            )
 
 
 # ---- bridge config ----
@@ -134,21 +186,34 @@ def _ok(client: MixedRelayClient, extra: dict | None = None) -> dict:
 def _run(thunk):
     """Standard error envelope for MCP tool bodies.
 
+    Errors are returned with a category prefix so client LLMs can decide
+    whether to retry, fix arguments, or surface a fatal error:
+
+    - ``validation: ...``  caller passed a bad argument; do NOT retry, fix it
+    - ``timeout: ...``     server didn't reply in time; retry usually safe
+    - ``transport: ...``   socket layer is dead; the bridge will try to
+                           reconnect on the next call; retry once may work
+    - ``server: ...``      server returned an explicit ERROR frame; do not
+                           retry without fixing the underlying cause
+    - ``internal: ...``    bridge / wrapper bug; report it
+
     We deliberately do NOT use a function wrapper / decorator: FastMCP builds
     the tool JSON schema from the function's actual code-object parameter
     names (``co_varnames``), not from ``__signature__`` or ``__wrapped__``.
-    A naive ``def inner(*args, **kwargs)`` wrapper would erase every typed
-    parameter and expose tools as taking ``args`` / ``kwargs`` strings only.
     Each tool body therefore calls ``_run(lambda: ...)`` directly.
     """
     try:
         return thunk()
+    except ValidationError as e:
+        return {"ok": False, "error": {"code": 400, "message": f"validation: {e}"}}
     except RemoteError as e:
-        return {"ok": False, "error": {"code": e.code, "message": e.text}}
+        return {"ok": False, "error": {"code": e.code, "message": f"server: {e.text}"}}
+    except TimeoutWaiting as e:
+        return {"ok": False, "error": {"code": 504, "message": f"timeout: {e}"}}
     except BrokenConnection as e:
-        return {"ok": False, "error": {"code": 0, "message": f"broken: {e}"}}
+        return {"ok": False, "error": {"code": 0, "message": f"transport: {e}"}}
     except Exception as e:
-        return {"ok": False, "error": {"code": -1, "message": str(e)}}
+        return {"ok": False, "error": {"code": -1, "message": f"internal: {e}"}}
 
 
 # ---- FastMCP app ----
@@ -160,23 +225,29 @@ mcp = FastMCP("mrelay-mcp")
 
 
 def _do_join(channel: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"bundle": c.join(channel)})
 
 
 def _do_part(channel: str, reason: str) -> dict:
+    _validate_channel(channel)
+    _validate_user_text(reason, label="reason")
     c = session.get()
     c.part(channel, reason)
     return _ok(c)
 
 
 def _do_say(channel: str, text: str) -> dict:
+    _validate_channel(channel)
+    _validate_user_text(text, label="text")
     c = session.get()
     c.say(channel, text)
     return _ok(c)
 
 
 def _do_who(channel: str, kind: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     if kind:
         c.send_raw("MRWHO", [channel, kind])
@@ -193,6 +264,20 @@ def _do_channels() -> dict:
 def _do_whois(nick: str) -> dict:
     c = session.get()
     return _ok(c, {"info": c.whois(nick)})
+
+
+def _do_whoami() -> dict:
+    """Return a snapshot of bridge-local identity / membership state.
+
+    No wire I/O — this is a read of in-process state and is safe to call
+    even when the socket is broken (the ``connected`` field reports it).
+    See ``MixedRelayClient.whoami`` for the rationale: in collision
+    environments the welcome bundle's members[] can have multiple entries
+    sharing the same USER, so callers can't pinpoint *self* from a
+    USER-only key.
+    """
+    c = session.get()
+    return _ok(c, {"whoami": c.whoami()})
 
 
 def _do_set_profile(profile: dict) -> dict:
@@ -219,43 +304,66 @@ def _do_subscribe_status(nick: str) -> dict:
 
 
 def _do_set_topic(channel: str, text: str) -> dict:
+    _validate_channel(channel)
+    _validate_user_text(text, label="topic text")
     c = session.get()
     c.set_topic(channel, text)
     return _ok(c)
 
 
 def _do_get_topic(channel: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"topic": c.get_topic(channel)})
 
 
 def _do_history(channel: str, direction: str, anchor: int, limit: int) -> dict:
+    _validate_channel(channel)
+    if direction.lower() not in ("before", "after"):
+        raise ValidationError(
+            f"direction must be 'before' or 'after': got {direction!r}"
+        )
+    if not isinstance(anchor, int) or anchor < 0:
+        raise ValidationError(
+            f"anchor must be a non-negative int (the seq to page from): got {anchor!r}"
+        )
+    if not isinstance(limit, int) or limit <= 0 or limit > 1000:
+        raise ValidationError(
+            f"limit must be int in 1..1000: got {limit!r}"
+        )
     c = session.get()
     return _ok(c, {"entries": c.history(channel, direction=direction, anchor=anchor, limit=limit)})
 
 
 def _do_read_get(channel: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"seq": c.read_get(channel)})
 
 
 def _do_read_set(channel: str, seq: int) -> dict:
+    _validate_channel(channel)
+    if not isinstance(seq, int) or seq < 0:
+        raise ValidationError(f"seq must be a non-negative int: got {seq!r}")
     c = session.get()
     c.read_set(channel, seq)
     return _ok(c)
 
 
 def _do_archive(channel: str, before_date: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"segment": c.archive(channel, before_date)})
 
 
 def _do_archive_list(channel: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"segments": c.archive_list(channel)})
 
 
 def _do_purge(channel: str) -> dict:
+    _validate_channel(channel)
     c = session.get()
     return _ok(c, {"purged": c.purge(channel)})
 
@@ -309,6 +417,20 @@ def mr_channels() -> dict:
 def mr_whois(nick: str) -> dict:
     """Look up identity / kind / reader-key summary for a nick."""
     return _run(lambda: _do_whois(nick))
+
+
+@mcp.tool()
+def mr_whoami() -> dict:
+    """Sync snapshot of *this bridge's own* identity and membership state.
+
+    Returns: ``{"ok": True, "whoami": {nick, user, kind, joined_channels,
+    status_subs, connected}}``. ``nick`` is the post auto-suffix (F-12.7)
+    current nick; ``user`` is the rename-invariant reader-key (F-1.3).
+    Use this to pinpoint *self* in a collision environment where the
+    welcome bundle members[] has multiple entries with the same USER.
+    Read-only and instant — no wire I/O.
+    """
+    return _run(_do_whoami)
 
 
 @mcp.tool()

@@ -34,6 +34,45 @@ class BrokenConnection(Exception):
     """Socket died mid-RPC. Caller should reconnect."""
 
 
+class TimeoutWaiting(BrokenConnection):
+    """RPC sent but the matching reply (or an ERROR for it) never arrived
+    within the deadline. Distinct from a plain ``BrokenConnection`` so
+    LLMs can tell ``transport dead`` from ``server slow / lost reply``,
+    but it still inherits BrokenConnection so existing GUI / SDK
+    ``except BrokenConnection`` handlers keep working unchanged."""
+
+
+class ValidationError(ValueError):
+    """Caller-side argument validation failed before any wire activity.
+    Raised so MCP tools can return a clear, immediate error that lets
+    even small LLMs notice and correct the mistake (e.g. forgetting the
+    leading ``#`` on a channel name).
+
+    Inherits ``ValueError`` so callers that catch the standard built-in
+    keep working; new code can ``except ValidationError`` to distinguish
+    it from other ValueErrors."""
+
+
+def _reject_wire_breakers(s: str, label: str) -> None:
+    """Refuse strings that would corrupt the line-based wire framing.
+
+    The wire is `\\r\\n`-delimited; a `\\n` (or NUL) embedded in a
+    user-supplied param or trailing splits a single intended frame into
+    two on the wire, and the server parses the second half as a new
+    command. We surface this as ValidationError so MCP tools route it to
+    the ``validation:`` prefix path (F-12.1) rather than letting it slip
+    through as a silent ERROR 421 cascade.
+    """
+    if not isinstance(s, str):
+        raise ValidationError(f"{label} must be a string")
+    for ch, name in (("\n", "newline"), ("\r", "carriage return"), ("\x00", "NUL")):
+        if ch in s:
+            raise ValidationError(
+                f"{label} must not contain {name} ({ch!r}); the wire is line-delimited "
+                f"so embedded line terminators corrupt framing"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Wire parser (minimal IRC-ish)
 # ---------------------------------------------------------------------------
@@ -151,6 +190,39 @@ class MixedRelayClient:
     def user(self) -> str:
         return self._user
 
+    def whoami(self) -> dict:
+        """Synchronous snapshot of bridge-local identity / membership state.
+
+        Exposed so MCP-tool consumers can pinpoint *self* in a collision
+        environment where the welcome bundle's ``members`` list contains
+        multiple entries sharing the same USER (the caller of mr_join cannot
+        otherwise distinguish "the entry that is me" from "another bridge
+        instance with the same configured base nick"). All fields are read
+        from in-process state — no wire I/O — so this returns immediately
+        regardless of socket health.
+
+        Returned shape:
+          - ``nick``: current registered nick (post auto-suffix if any)
+          - ``user``: stable reader-key (unchanged across rename / suffix)
+          - ``kind``: "human" / "agent" / "tool" / "observer"
+          - ``joined_channels``: list of channels we believe ourselves to be
+            in (sorted; the bridge maintains this set across reconnect via
+            the rejoin replay in ``connect()``)
+          - ``status_subs``: list of currently-held status subscription
+            targets (nicks or "*"; sorted)
+          - ``connected``: True if we have a live socket and have not seen
+            a broken-flag transition. Useful for distinguishing "we think
+            we're #lobby but the socket just died" from healthy state.
+        """
+        return {
+            "nick": self._nick,
+            "user": self._user,
+            "kind": self._kind,
+            "joined_channels": sorted(self._joined_channels),
+            "status_subs": sorted(self._status_subs),
+            "connected": self._sock is not None and not self._broken,
+        }
+
     # ----- connection lifecycle -----
 
     def connect(self) -> None:
@@ -160,13 +232,37 @@ class MixedRelayClient:
         self._broken = False
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        self.send_raw("NICK", [self._nick])
-        self.send_raw("USER", [self._user, "0", "*"], trailing=self._nick, has_trail=True)
-        self.send_raw("MRKIND", [self._kind])
-        # wait for top-level MRWELCOME (server welcome banner, no channel param)
-        m = self._pop_match(lambda m: m.command == "MRWELCOME" and not m.params, timeout=3)
-        if m is None:
-            raise BrokenConnection("server did not greet within 3s")
+
+        # Auto-suffix on NICK collision so two clients with the same configured
+        # nick (e.g. VSCode-Claude + CLI-Claude both spawning a bridge as
+        # "claude_miko") can both register without one being silently broken.
+        # USER (reader-key / cursor identity) stays unchanged so the human-
+        # facing "this is the same person" continuity is preserved across the
+        # rename — only the wire NICK gets a numeric suffix.
+        base_nick = self._nick
+        attempts = 0
+        max_attempts = 10
+        while True:
+            attempts += 1
+            self.send_raw("NICK", [self._nick])
+            self.send_raw("USER", [self._user, "0", "*"], trailing=self._nick, has_trail=True)
+            self.send_raw("MRKIND", [self._kind])
+            m = self._pop_match(
+                lambda m: (m.command == "MRWELCOME" and not m.params)
+                or (m.command == "ERROR" and m.params and m.params[0] in ("433", "432")),
+                timeout=3,
+            )
+            if m is None:
+                raise BrokenConnection("server did not greet within 3s")
+            if m.command == "MRWELCOME":
+                break
+            # ERROR 433 (nick in use) or 432 (invalid nick).
+            if attempts >= max_attempts:
+                raise BrokenConnection(
+                    f"could not register a unique nick after {attempts} attempts "
+                    f"(last reply: {m.params[0]} {m.trailing!r}); base was {base_nick!r}"
+                )
+            self._nick = f"{base_nick}_{attempts + 1}"
         # rev10: restore session-scoped state so the caller doesn't have to
         # know a reconnect happened (F-12). Profile / status first so peers
         # see a coherent snapshot; then rejoin channels; then replay status
@@ -230,6 +326,17 @@ class MixedRelayClient:
     def send_raw(self, command: str, params: Optional[list[str]] = None, trailing: str = "", has_trail: bool = False) -> None:
         if self._sock is None:
             raise BrokenConnection("not connected")
+        # Defence-in-depth: reject embedded line terminators / NUL anywhere in
+        # the outbound frame. Without this, a multi-line user text in the
+        # trailing splits at the first '\n' on the wire and the server parses
+        # the rest as fresh commands (we hit this in the wild — a
+        # multi-paragraph PRIVMSG produced ERROR 421 "unknown command: (2)"
+        # for every paragraph after the first). Catch it before send() so the
+        # caller gets a clear ValidationError instead of a silent split.
+        for p in params or []:
+            _reject_wire_breakers(p, "param")
+        if has_trail:
+            _reject_wire_breakers(trailing, "trailing")
         line = encode("", command, params or [], trailing, has_trail)
         try:
             self._sock.sendall((line + "\r\n").encode("utf-8"))
@@ -448,9 +555,14 @@ class MixedRelayClient:
             self.send_raw("MRCHANNELS", [])
             out: list[dict] = []
             while True:
-                m = self._pop_match(lambda m: m.command == "MRCHANNELS", timeout=3)
+                m = self._pop_match(
+                    lambda m: m.command == "MRCHANNELS" or m.command == "ERROR",
+                    timeout=3,
+                )
                 if m is None:
-                    raise BrokenConnection("MRCHANNELS timed out")
+                    raise TimeoutWaiting("MRCHANNELS reply not received")
+                if m.command == "ERROR":
+                    raise RemoteError(int(m.params[0]) if m.params else 0, m.trailing)
                 if m.params and m.params[0] == "END":
                     return out
                 if len(m.params) >= 3:
@@ -484,9 +596,14 @@ class MixedRelayClient:
             self.send_raw("MRHISTORY", [channel, direction.upper(), str(anchor), str(limit)])
             out: list[dict] = []
             while True:
-                m = self._pop_match(lambda m: m.command == "MRHISTORY", timeout=5)
+                m = self._pop_match(
+                    lambda m: m.command == "MRHISTORY" or m.command == "ERROR",
+                    timeout=5,
+                )
                 if m is None:
-                    raise BrokenConnection("MRHISTORY timed out")
+                    raise TimeoutWaiting("MRHISTORY reply not received within 5s")
+                if m.command == "ERROR":
+                    raise RemoteError(int(m.params[0]) if m.params else 0, m.trailing)
                 if m.params and m.params[0] == "END":
                     return out
                 if m.has_trail:
@@ -496,11 +613,14 @@ class MixedRelayClient:
         with self._rpc_lock:
             self.send_raw("MRREAD", ["GET", channel])
             m = self._pop_match(
-                lambda m: m.command == "MRREAD" and len(m.params) >= 2 and m.params[0] == channel,
+                lambda m: (m.command == "MRREAD" and len(m.params) >= 2 and m.params[0] == channel)
+                or m.command == "ERROR",
                 timeout=3,
             )
         if m is None:
-            raise BrokenConnection("MRREAD GET timed out")
+            raise TimeoutWaiting("MRREAD GET reply not received within 3s")
+        if m.command == "ERROR":
+            raise RemoteError(int(m.params[0]) if m.params else 0, m.trailing)
         return int(m.params[1])
 
     def read_set(self, channel: str, seq: int) -> None:
@@ -527,9 +647,14 @@ class MixedRelayClient:
             self.send_raw("MRARCHIVE", ["LIST", channel])
             out: list[dict] = []
             while True:
-                m = self._pop_match(lambda m: m.command == "MRARCHIVE" and len(m.params) >= 2, timeout=3)
+                m = self._pop_match(
+                    lambda m: (m.command == "MRARCHIVE" and len(m.params) >= 2) or m.command == "ERROR",
+                    timeout=3,
+                )
                 if m is None:
-                    raise BrokenConnection("MRARCHIVE LIST timed out")
+                    raise TimeoutWaiting("MRARCHIVE LIST reply not received within 3s")
+                if m.command == "ERROR":
+                    raise RemoteError(int(m.params[0]) if m.params else 0, m.trailing)
                 if m.params[1] == "END":
                     return out
                 if m.params[1] == "SEG" and m.has_trail:
@@ -632,6 +757,23 @@ def _msg_to_event(m: Message, my_nick: str) -> dict:
     elif cmd == "MRWELCOME" and m.params:
         ev["kind"] = "welcome"
         ev["channel"] = m.params[0]
+    elif cmd == "MRPURGE":
+        # F-13.6 broadcast form: ":<nick>!<user>@host MRPURGE #<ch>".
+        # Synchronous purge() swallows the server's :server MRPURGE #ch DONE
+        # reply via _pop_match before it reaches poll(), so in normal use this
+        # branch only fires for purges performed by *other* agents on a
+        # channel we are JOIN'd to. Surface it as a typed event so the
+        # consuming LLM can notice the reset rather than seeing a raw frame.
+        ev["kind"] = "purge"
+        ev["from"] = _nick_from_prefix(m.prefix)
+        ev["channel"] = m.params[0] if m.params else ""
+        if len(m.params) >= 2 and m.params[1] == "DONE":
+            ev["done"] = True
+            if m.has_trail:
+                try:
+                    ev["count"] = int(m.trailing)
+                except ValueError:
+                    pass
     elif cmd == "ERROR":
         ev["kind"] = "error"
     return ev
