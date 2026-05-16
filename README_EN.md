@@ -140,7 +140,12 @@ PRIVMSG #lobby :hello from telnet
 | `MRELAY_NICK` | `mcp-agent` / `alice` | Default nick for the bridge / GUI |
 | `MRELAY_USER` | value of `MRELAY_NICK` | Bridge reader key (for cursor continuation) |
 | `MRELAY_KIND` | `agent` / `human` | Kind of the bridge / GUI |
-| `MRELAY_IDLE` | `0` | Bridge idle-recycle in seconds (0 = disabled, unified into the F-11 keepalive) |
+| `MRELAY_IDLE` | `0` | Bridge TCP-socket idle-recycle in seconds (0 = disabled, unified into the F-11 keepalive) |
+| `MRELAY_PROC_IDLE_SEC` | `1800` | Idle TTL for the bridge **process itself** in seconds (0 = disabled). Fires only when the bridge is stateless and has zero in-flight requests; recycles generations the host has forgotten about |
+| `MRELAY_PROC_IDLE_POLL_SEC` | (auto) | Idle-watchdog polling period (auto-derived as TTL/10, clamped to 0.5 .. 30s). Set explicitly to override |
+| `MRELAY_PARENT_WATCH_SEC` | `30` | Period in seconds for checking parent-process liveness (0 = disabled). Exits on parent loss or PID-reuse reparent |
+| `MRELAY_RECONNECT_GRACE_SEC` | `60` | Grace window in seconds for an unconsumed MRRECONNECT event; holds back the stateless TTL until the caller drains it via `mr_poll` / `mr_wait_for` |
+| `MRELAY_LIFECYCLE_LOG` | `1` | Emit lifecycle log lines (`event=startup` / `event=shutdown` / `event=reconnect` / `event=broken` etc.) on stderr (0 = disabled) |
 
 ---
 
@@ -213,3 +218,4 @@ Highlights:
 - Archive (MRARCHIVE) — transparent query across active + archive
 - PING/PONG keepalive (F-11) — automatic detection and drop of idle connections
 - Bridge auto-rejoin + synchronous `say()` ack
+- Bridge-process self-recycle — idle TTL + parent watchdog let abandoned, stateless bridge generations exit on their own, preventing process accumulation when long-lived hosts forget about them

@@ -10,12 +10,14 @@ import functools
 import inspect
 import json
 import os
+import sys
 import threading
 import time
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from . import lifecycle
 from .client import (
     BrokenConnection,
     MixedRelayClient,
@@ -86,6 +88,15 @@ class BridgeConfig:
         # proactively tear down its socket after N seconds of tool inactivity
         # (opt-in, not recommended for lobby-resident use).
         self.idle_timeout_sec = int(os.environ.get("MRELAY_IDLE", "0"))
+        # How long the bridge keeps an unconsumed MRRECONNECT event around
+        # before letting the idle watchdog recycle the (otherwise stateless)
+        # process. See `BridgeSession.is_stateless()`.
+        try:
+            self.reconnect_grace_sec = float(
+                os.environ.get("MRELAY_RECONNECT_GRACE_SEC", "60")
+            )
+        except ValueError:
+            self.reconnect_grace_sec = 60.0
 
 
 # ---- shared client with lazy reconnect ----
@@ -108,6 +119,10 @@ class BridgeSession:
         self._lock = threading.Lock()
         self._last_use = 0.0
         self._reconnect_pending = False
+        # ``time.monotonic()`` reading captured the moment
+        # ``_reconnect_pending`` flips True, used by ``is_stateless()`` to
+        # implement the grace period documented in plan-7/8.
+        self._reconnect_pending_at: float = 0.0
         self._missed_ms = 0
         # Session-scoped intent (survives client recreation).
         self._joined_channels: set[str] = set()
@@ -119,13 +134,21 @@ class BridgeSession:
         with self._lock:
             now = time.monotonic()
             need_new = False
+            reason = ""
             if self._client is None:
                 need_new = True
+                reason = "first_use"
             elif self._client._broken:
                 need_new = True
+                reason = "broken"
             elif self.cfg.idle_timeout_sec > 0 and now - self._last_use > self.cfg.idle_timeout_sec:
                 need_new = True
+                reason = "idle_timeout"
             if need_new:
+                sys.stderr.write(
+                    f"[mrelay-mcp bridge] event=reconnect reason={reason}\n"
+                )
+                sys.stderr.flush()
                 # Snapshot caller intent from the dying client *before* we
                 # discard it, so the new client's connect() can replay it.
                 # First-use case: nothing to snapshot, _last_*/_joined_* are
@@ -156,8 +179,70 @@ class BridgeSession:
                 c.connect()
                 self._client = c
                 self._reconnect_pending = self._missed_ms > 0
+                if self._reconnect_pending:
+                    # Anchor the grace clock on each flip, so a second
+                    # reconnect inside the same grace window restarts the
+                    # caller's chance to see MRRECONNECT.
+                    self._reconnect_pending_at = now
             self._last_use = now
             return self._client
+
+    def is_stateless(self) -> bool:
+        """True iff the bridge holds no resident user-intent state and
+        no unconsumed MRRECONNECT inside the configured grace period.
+
+        Evaluation order (= plan-8):
+
+        1. Compute non-reconnect stateful signals first. The live
+           ``MixedRelayClient`` is authoritative for ``_joined_channels``
+           / ``_status_subs`` / ``_last_profile`` / ``_last_status`` and
+           also owns ``_queue`` (= unread wire events). The session-level
+           snapshot is only used when ``_client is None`` during a
+           transient reconnect.
+
+        2. If any non-reconnect signal is True we return ``False``
+           without touching ``_reconnect_pending`` — a stateful resident
+           that has not polled yet must keep its MRRECONNECT
+           visibility, independent of grace timing.
+
+        3. If we get here, the bridge is otherwise stateless. Evaluate
+           ``_reconnect_pending`` against the grace window. Inside the
+           window: ``False`` (= reserve the event). Beyond the window:
+           drop the flag with a single warn line (the caller never
+           polled, so visibility is forfeit) and return ``True``.
+        """
+        with self._lock:
+            c = self._client
+            if c is not None:
+                client_stateful = (
+                    bool(c._joined_channels)
+                    or bool(c._status_subs)
+                    or c._last_profile is not None
+                    or c._last_status is not None
+                    or len(c._queue) > 0
+                )
+                if client_stateful:
+                    return False
+            else:
+                snapshot_stateful = (
+                    bool(self._joined_channels)
+                    or bool(self._status_subs)
+                    or self._last_profile is not None
+                    or self._last_status is not None
+                )
+                if snapshot_stateful:
+                    return False
+            if self._reconnect_pending:
+                elapsed = time.monotonic() - self._reconnect_pending_at
+                if elapsed < self.cfg.reconnect_grace_sec:
+                    return False
+                self._reconnect_pending = False
+                sys.stderr.write(
+                    "[mrelay-mcp bridge] event=reconnect_event_dropped "
+                    f"reason=grace_expired_stateless elapsed_sec={int(elapsed)}\n"
+                )
+                sys.stderr.flush()
+            return True
 
     def consume_reconnect_event(self) -> Optional[dict]:
         with self._lock:
@@ -202,18 +287,22 @@ def _run(thunk):
     names (``co_varnames``), not from ``__signature__`` or ``__wrapped__``.
     Each tool body therefore calls ``_run(lambda: ...)`` directly.
     """
+    lifecycle.mark_request_start()
     try:
-        return thunk()
-    except ValidationError as e:
-        return {"ok": False, "error": {"code": 400, "message": f"validation: {e}"}}
-    except RemoteError as e:
-        return {"ok": False, "error": {"code": e.code, "message": f"server: {e.text}"}}
-    except TimeoutWaiting as e:
-        return {"ok": False, "error": {"code": 504, "message": f"timeout: {e}"}}
-    except BrokenConnection as e:
-        return {"ok": False, "error": {"code": 0, "message": f"transport: {e}"}}
-    except Exception as e:
-        return {"ok": False, "error": {"code": -1, "message": f"internal: {e}"}}
+        try:
+            return thunk()
+        except ValidationError as e:
+            return {"ok": False, "error": {"code": 400, "message": f"validation: {e}"}}
+        except RemoteError as e:
+            return {"ok": False, "error": {"code": e.code, "message": f"server: {e.text}"}}
+        except TimeoutWaiting as e:
+            return {"ok": False, "error": {"code": 504, "message": f"timeout: {e}"}}
+        except BrokenConnection as e:
+            return {"ok": False, "error": {"code": 0, "message": f"transport: {e}"}}
+        except Exception as e:
+            return {"ok": False, "error": {"code": -1, "message": f"internal: {e}"}}
+    finally:
+        lifecycle.mark_request_end()
 
 
 # ---- FastMCP app ----
@@ -581,7 +670,26 @@ def main() -> None:
     cfg.nick = args.nick
     cfg.user = args.user
     cfg.kind = args.kind
-    mcp.run()
+    # cfg is fully resolved here — install lifecycle so startup log,
+    # idle TTL and parent watchdog all see the final addr/nick.
+    lifecycle.startup(cfg, is_stateless_provider=session.is_stateless)
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        lifecycle.shutdown("signal_int")
+        raise
+    except SystemExit as e:
+        lifecycle.shutdown("system_exit", code=e.code)
+        raise
+    except Exception as e:
+        lifecycle.shutdown(
+            "exception",
+            type=type(e).__name__,
+            message=str(e),
+        )
+        raise
+    else:
+        lifecycle.shutdown("normal")
 
 
 if __name__ == "__main__":

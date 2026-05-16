@@ -9,11 +9,27 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+
+def _log_broken(site: str, reason: str) -> None:
+    """One-line stderr log for transitions that flip ``_broken`` to True.
+
+    Centralised so the format stays consistent across the five wire
+    sites that need it (= see plan-3/4). Failing silently if stderr is
+    closed prevents broken-state logging from itself raising."""
+    try:
+        sys.stderr.write(
+            f"[mrelay-mcp client] event=broken site={site} reason={reason}\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -253,11 +269,13 @@ class MixedRelayClient:
                 timeout=3,
             )
             if m is None:
+                _log_broken("connect", "greet_timeout_3s")
                 raise BrokenConnection("server did not greet within 3s")
             if m.command == "MRWELCOME":
                 break
             # ERROR 433 (nick in use) or 432 (invalid nick).
             if attempts >= max_attempts:
+                _log_broken("connect", f"nick_register_exhausted_after_{attempts}")
                 raise BrokenConnection(
                     f"could not register a unique nick after {attempts} attempts "
                     f"(last reply: {m.params[0]} {m.trailing!r}); base was {base_nick!r}"
@@ -318,6 +336,7 @@ class MixedRelayClient:
             pass
         self._sock = None
         self._broken = True
+        _log_broken("close", "client_close")
         with self._cv:
             self._cv.notify_all()
 
@@ -342,6 +361,7 @@ class MixedRelayClient:
             self._sock.sendall((line + "\r\n").encode("utf-8"))
         except OSError as e:
             self._broken = True
+            _log_broken("send_raw", f"OSError:{e}")
             raise BrokenConnection(f"send failed: {e}")
 
     def send_verbatim(self, raw: str) -> None:
@@ -353,6 +373,7 @@ class MixedRelayClient:
             self._sock.sendall(raw.encode("utf-8"))
         except OSError as e:
             self._broken = True
+            _log_broken("send_verbatim", f"OSError:{e}")
             raise BrokenConnection(f"send failed: {e}")
 
     # ----- read loop -----
@@ -367,6 +388,7 @@ class MixedRelayClient:
                 chunk = b""
             if not chunk:
                 self._broken = True
+                _log_broken("read_loop", "eof")
                 with self._cv:
                     self._cv.notify_all()
                 return

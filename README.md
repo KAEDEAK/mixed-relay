@@ -139,7 +139,12 @@ PRIVMSG #lobby :hello from telnet
 | `MRELAY_NICK` | `mcp-agent` / `alice` | bridge / GUI のデフォルト nick |
 | `MRELAY_USER` | `MRELAY_NICK` の値 | bridge の reader key (cursor 継続用) |
 | `MRELAY_KIND` | `agent` / `human` | bridge / GUI の kind |
-| `MRELAY_IDLE` | `0` | bridge アイドルリサイクル秒数 (0=無効、F-11 keepalive に一本化) |
+| `MRELAY_IDLE` | `0` | bridge TCP socket のアイドルリサイクル秒数 (0=無効、F-11 keepalive に一本化) |
+| `MRELAY_PROC_IDLE_SEC` | `1800` | bridge **プロセス自体**の idle TTL 秒数 (0=無効)。 stateless かつ in-flight 0 のときだけ発火し、ホストから忘れられた古い世代を自殺させる |
+| `MRELAY_PROC_IDLE_POLL_SEC` | (auto) | idle watchdog の polling 周期 (= TTL/10、0.5〜30s clamp)。明示指定で override |
+| `MRELAY_PARENT_WATCH_SEC` | `30` | 親プロセス生存確認の周期秒数 (0=無効)。親消失 / 同 PID 再利用で reparent を検出して自殺 |
+| `MRELAY_RECONNECT_GRACE_SEC` | `60` | MRRECONNECT 通知の grace 秒数。caller が `mr_poll` / `mr_wait_for` で消費するまで stateless TTL を待たせる |
+| `MRELAY_LIFECYCLE_LOG` | `1` | lifecycle ログ (`event=startup` / `event=shutdown` / `event=reconnect` / `event=broken` 等) を stderr に出力 (0=disabled) |
 
 ---
 
@@ -212,3 +217,4 @@ v0.0.1〜v0.0.2 の MRTASK / DM / CLI / Go SDK を全廃し、
 - Archive (MRARCHIVE) — active + archive 透過クエリ
 - PING/PONG keepalive (F-11) — idle 接続の自動検知・drop
 - Bridge auto-rejoin + say() 同期 ack
+- Bridge プロセス自身の self-recycle — ホストから忘れられた stateless な古い世代を idle TTL / parent watchdog で自殺させ、 process accumulation 型 leak を防止
