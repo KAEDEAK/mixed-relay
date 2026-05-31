@@ -35,7 +35,38 @@ IRC ライクな TCP 行ベースのコミュニケーションリレーです�
 
 ## Quick start
 
-### 1. Server を起動
+### 1. Python 環境を準備
+
+GUI / MCP bridge を個別の仮想環境で動かしたい場合は、各ディレクトリ直下の
+`setup.bat` を実行します。`uv` があれば `uv` を使い、なければ標準の
+`python -m venv` に fallback します。
+
+```bat
+cd mrelay_gui
+setup.bat
+
+cd ..\mrelay-mcp
+setup.bat
+```
+
+- `mrelay_gui\setup.bat` は `mrelay_gui\.venv` を作成し、Tkinter が使えることを確認します
+- `mrelay-mcp\setup.bat` は `mrelay-mcp\.venv` を作成し、`requirements.txt` と package 本体を editable install します
+
+GUI launcher で作成済み venv を使う場合:
+
+```bat
+set MRELAY_PY=mrelay_gui\.venv\Scripts\python.exe
+scripts\mrelay-gui.bat
+```
+
+MCP bridge を手動起動する場合:
+
+```bat
+cd mrelay-mcp
+.venv\Scripts\python.exe -m mrelay_mcp.server
+```
+
+### 2. Server を起動
 
 **localhost only (推奨デフォルト)** — `127.0.0.1:6767` にバインド:
 
@@ -67,7 +98,7 @@ scripts\start-mrelayd_shared.bat
 Go binary は scripts が PATH や OS 既知パスから自動解決します。
 検出失敗時は `MRELAY_GO` 環境変数で明示してください。
 
-### 2. GUI で接続
+### 3. GUI で接続
 
 ```bash
 # Windows
@@ -98,7 +129,7 @@ GUI のスラッシュコマンド:
 
 `/` なしの入力はアクティブチャンネルへの PRIVMSG になります。
 
-### 3. AI エージェントから接続 (MCP bridge)
+### 4. AI エージェントから接続 (MCP bridge)
 
 MCP bridge は各 AI クライアントの global MCP config で自動起動します。
 
@@ -122,7 +153,7 @@ MCP bridge のプロセス lifecycle:
 - MCP host が bridge を起動し直しても古いプロセスが残り続けないように、idle TTL / hard idle TTL / parent watchdog / 同一 identity の旧世代整理で自動終了します
 - 長時間実行中の `mr_poll` / `mr_wait_for` など、処理中の tool call は自動終了の対象外です
 
-### 4. telnet でデバッグ
+### 5. telnet でデバッグ
 
 ```
 telnet 127.0.0.1 6767
@@ -189,6 +220,20 @@ PRIVMSG #lobby :hello from telnet
 ## Build & test
 
 Go 1.22+ と Python 3.10+ が必要です。
+
+Server 部 (`./cmd/mrelayd`) は `scripts/build-mrelayd.*` で repo root にビルドできます。
+Go binary は `PATH` から自動検出され、必要なら `MRELAY_GO` で明示できます。
+
+```bash
+# Windows cmd
+scripts\build-mrelayd.bat
+
+# PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\build-mrelayd.ps1
+
+# bash / WSL / Linux / macOS
+./scripts/build-mrelayd.sh
+```
 
 ```bash
 # Go

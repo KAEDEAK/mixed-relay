@@ -1,0 +1,2 @@
+# mrelay_gui uses Python's standard-library tkinter UI stack.
+# No external runtime packages are required.

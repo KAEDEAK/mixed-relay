@@ -34,7 +34,38 @@ features for hiding things.
 
 ## Quick start
 
-### 1. Start the server
+### 1. Prepare the Python environments
+
+If you want to run the GUI and MCP bridge from separate virtual environments,
+run the `setup.bat` file at the root of each component. The script uses `uv`
+when available, and falls back to the standard `python -m venv` path.
+
+```bat
+cd mrelay_gui
+setup.bat
+
+cd ..\mrelay-mcp
+setup.bat
+```
+
+- `mrelay_gui\setup.bat` creates `mrelay_gui\.venv` and verifies that Tkinter is available
+- `mrelay-mcp\setup.bat` creates `mrelay-mcp\.venv`, installs `requirements.txt`, and editable-installs the package itself
+
+To run the GUI launcher with the prepared venv:
+
+```bat
+set MRELAY_PY=mrelay_gui\.venv\Scripts\python.exe
+scripts\mrelay-gui.bat
+```
+
+To launch the MCP bridge manually:
+
+```bat
+cd mrelay-mcp
+.venv\Scripts\python.exe -m mrelay_mcp.server
+```
+
+### 2. Start the server
 
 **localhost only (recommended default)** — binds to `127.0.0.1:6767`:
 
@@ -68,7 +99,7 @@ The Go binary is auto-resolved by the scripts from `PATH` or known OS
 locations. If detection fails, set the `MRELAY_GO` environment variable
 explicitly.
 
-### 2. Connect with the GUI
+### 3. Connect with the GUI
 
 ```bash
 # Windows
@@ -99,7 +130,7 @@ GUI slash commands:
 
 Input without a leading `/` is sent as a PRIVMSG to the active channel.
 
-### 3. Connect from an AI agent (MCP bridge)
+### 4. Connect from an AI agent (MCP bridge)
 
 The MCP bridge is auto-launched by the global MCP config of each AI client.
 
@@ -123,7 +154,7 @@ MCP bridge process lifecycle:
 - If an MCP host starts a new bridge generation, old bridge processes are prevented from accumulating by idle TTL / hard idle TTL / parent watchdogs / same-identity supersession
 - In-flight tool calls such as long-running `mr_poll` / `mr_wait_for` are not recycled mid-call
 
-### 4. Debug with telnet
+### 5. Debug with telnet
 
 ```
 telnet 127.0.0.1 6767
@@ -190,6 +221,21 @@ PRIVMSG #lobby :hello from telnet
 ## Build & test
 
 Requires Go 1.22+ and Python 3.10+.
+
+The server component (`./cmd/mrelayd`) can be built to the repo root with
+`scripts/build-mrelayd.*`. The scripts auto-detect the Go binary from `PATH`;
+set `MRELAY_GO` if you need to point at a specific executable.
+
+```bash
+# Windows cmd
+scripts\build-mrelayd.bat
+
+# PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\build-mrelayd.ps1
+
+# bash / WSL / Linux / macOS
+./scripts/build-mrelayd.sh
+```
 
 ```bash
 # Go
