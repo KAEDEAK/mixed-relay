@@ -115,6 +115,13 @@ mr_poll(timeout_ms=2000)
 mr_set_status({"intent": "reviewing code"})
 ```
 
+MCP bridge のプロセス lifecycle:
+
+- bridge は startup / shutdown / reconnect / broken を stderr に lifecycle log として出力します
+- `mr_instances()` で、現在記録されている `mrelay-mcp` bridge インスタンスを確認できます
+- MCP host が bridge を起動し直しても古いプロセスが残り続けないように、idle TTL / hard idle TTL / parent watchdog / 同一 identity の旧世代整理で自動終了します
+- 長時間実行中の `mr_poll` / `mr_wait_for` など、処理中の tool call は自動終了の対象外です
+
 ### 4. telnet でデバッグ
 
 ```
@@ -140,9 +147,13 @@ PRIVMSG #lobby :hello from telnet
 | `MRELAY_USER` | `MRELAY_NICK` の値 | bridge の reader key (cursor 継続用) |
 | `MRELAY_KIND` | `agent` / `human` | bridge / GUI の kind |
 | `MRELAY_IDLE` | `0` | bridge TCP socket のアイドルリサイクル秒数 (0=無効、F-11 keepalive に一本化) |
-| `MRELAY_PROC_IDLE_SEC` | `1800` | bridge **プロセス自体**の idle TTL 秒数 (0=無効)。 stateless かつ in-flight 0 のときだけ発火し、ホストから忘れられた古い世代を自殺させる |
-| `MRELAY_PROC_IDLE_POLL_SEC` | (auto) | idle watchdog の polling 周期 (= TTL/10、0.5〜30s clamp)。明示指定で override |
-| `MRELAY_PARENT_WATCH_SEC` | `30` | 親プロセス生存確認の周期秒数 (0=無効)。親消失 / 同 PID 再利用で reparent を検出して自殺 |
+| `MRELAY_PROC_IDLE_SEC` | `1800` | bridge **プロセス自体**の soft idle TTL 秒数 (0=無効)。stateless かつ in-flight 0 のときだけ自動終了 |
+| `MRELAY_PROC_HARD_IDLE_SEC` | `300` | bridge **プロセス自体**の hard idle TTL 秒数 (0=無効)。in-flight 0 なら joined channel などの状態が残っていても自動終了し、MCP host 起因のプロセス蓄積を防止 |
+| `MRELAY_PROC_IDLE_POLL_SEC` | (auto) | idle watchdog の polling 周期 (= 有効な soft/hard TTL の短い方 / 10、0.5〜30s clamp)。明示指定で override |
+| `MRELAY_PARENT_WATCH_SEC` | `30` | 親プロセス生存確認の polling 周期秒数 (0=無効)。親消失 / 同 PID 再利用で reparent を検出して自動終了 |
+| `MRELAY_NATIVE_PARENT_WAIT` | `1` | OS の親プロセス待機機構を使う parent watchdog (1=有効、0=無効)。Windows / Linux で対応、未対応 OS は polling に fallback |
+| `MRELAY_SUPERSEDE_OLDER` | `1` | 同じ `addr` / `nick` / `user` の古い bridge 世代を startup 時に停止対象へ移す (1=有効、0=無効) |
+| `MRELAY_SUPERSEDE_GRACE_SEC` | `5` | 直近に起動した同一 identity の bridge を競合起動として扱い、旧世代整理から除外する猶予秒数 |
 | `MRELAY_RECONNECT_GRACE_SEC` | `60` | MRRECONNECT 通知の grace 秒数。caller が `mr_poll` / `mr_wait_for` で消費するまで stateless TTL を待たせる |
 | `MRELAY_LIFECYCLE_LOG` | `1` | lifecycle ログ (`event=startup` / `event=shutdown` / `event=reconnect` / `event=broken` 等) を stderr に出力 (0=disabled) |
 
@@ -217,4 +228,4 @@ v0.0.1〜v0.0.2 の MRTASK / DM / CLI / Go SDK を全廃し、
 - Archive (MRARCHIVE) — active + archive 透過クエリ
 - PING/PONG keepalive (F-11) — idle 接続の自動検知・drop
 - Bridge auto-rejoin + say() 同期 ack
-- Bridge プロセス自身の self-recycle — ホストから忘れられた stateless な古い世代を idle TTL / parent watchdog で自殺させ、 process accumulation 型 leak を防止
+- Bridge プロセス lifecycle 管理 — MCP host から呼び出したときに古い bridge 世代が残り続けないよう、soft idle TTL / hard idle TTL / parent watchdog / 同一 identity の旧世代整理でプロセス蓄積を防止

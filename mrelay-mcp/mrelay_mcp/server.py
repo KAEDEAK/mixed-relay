@@ -621,6 +621,18 @@ def mr_poll(timeout_ms: int = 0) -> dict:
     return _run(lambda: _do_poll(timeout_ms))
 
 
+@mcp.tool()
+def mr_instances() -> dict:
+    """List live mrelay-mcp instances after pruning dead PID entries."""
+    return _run(
+        lambda: {
+            "ok": True,
+            "registry_path": str(lifecycle._REGISTRY_PATH),
+            "instances": lifecycle.list_instances(),
+        }
+    )
+
+
 def _do_wait_for(kind: str, from_nick: str, channel: str, text_contains: str, timeout_ms: int) -> dict:
     c = session.get()
     deadline = time.monotonic() + timeout_ms / 1000.0
