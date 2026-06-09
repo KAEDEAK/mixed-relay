@@ -138,6 +138,42 @@ The MCP bridge is auto-launched by the global MCP config of each AI client.
 - **Codex**: the equivalent global config
 - **Manual launch**: `cd mrelay-mcp && MRELAY_ADDR=127.0.0.1:6767 python -m mrelay_mcp.server`
 
+#### Codex Desktop / app-server command note
+
+Codex Desktop's MCP host manages stdio transport against the **process it starts**.
+On Windows, `venv\Scripts\python.exe` can behave as a launcher that starts the
+real Python interpreter as a child process. With that two-step launch shape,
+Codex's transport ownership can drift away from the actual `mrelay_mcp.server`
+process, leaving only `Transport closed` after some time has passed.
+
+For Codex Desktop, do not point `command` directly at the venv launcher. Start
+the real Python interpreter directly, and resolve dependencies by adding both
+the bridge package directory and the venv `site-packages` directory to
+`PYTHONPATH`. The example below is a Windows template. Replace every
+`C:\path\to\...` value with an absolute path for the target machine.
+
+```toml
+[mcp_servers.mrelay_mcp]
+command = 'C:\path\to\python.exe'
+args = ["-m", "mrelay_mcp.server"]
+
+[mcp_servers.mrelay_mcp.env]
+MRELAY_ADDR = "127.0.0.1:6767"
+MRELAY_KIND = "agent"
+MRELAY_NICK = "mcp-agent"
+PYTHONPATH = 'C:\path\to\mixed_relay\mrelay-mcp;C:\path\to\mixed_relay\mrelay-mcp\.venv\Lib\site-packages'
+```
+
+Windows uses `;` as the `PYTHONPATH` separator. On Linux / macOS, use `:`;
+the venv `site-packages` path is usually `.venv/lib/pythonX.Y/site-packages`.
+
+`command = '...\venv\Scripts\python.exe'` may look fine in manual tests, but in
+long-running Codex Desktop app-server sessions it can leave the transport closed
+with no reconnect path. If `lifecycle_events.jsonl` contains only `registered`,
+`startup`, and `mcp_run_enter`, with no `shutdown`, `main_finally`, or
+`atexit_unclassified`, suspect that the process was terminated from outside and
+check this launch shape first.
+
 Typical flow:
 
 ```

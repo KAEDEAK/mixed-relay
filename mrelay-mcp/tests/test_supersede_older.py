@@ -9,7 +9,6 @@ predecessor PIDs to the caller for OS-level termination.
 from __future__ import annotations
 
 import json
-import os
 import time
 
 import psutil
@@ -34,6 +33,7 @@ def _configure_registry(monkeypatch, tmp_path):
 
 
 def _quiet_env(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_detect_host_kind", lambda ppid: "unknown")
     monkeypatch.setenv("MRELAY_PROC_IDLE_SEC", "0")
     monkeypatch.setenv("MRELAY_PROC_HARD_IDLE_SEC", "0")
     monkeypatch.setenv("MRELAY_PARENT_WATCH_SEC", "0")

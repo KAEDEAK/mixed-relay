@@ -6,8 +6,6 @@ tasks, no credentials. USER is a public reader-key bookmark.
 from __future__ import annotations
 
 import argparse
-import functools
-import inspect
 import json
 import os
 import sys
@@ -185,6 +183,7 @@ class BridgeSession:
                     # caller's chance to see MRRECONNECT.
                     self._reconnect_pending_at = now
             self._last_use = now
+            assert self._client is not None
             return self._client
 
     def is_stateless(self) -> bool:
@@ -677,14 +676,38 @@ def main() -> None:
     parser.add_argument("--nick", default=cfg.nick)
     parser.add_argument("--user", default=cfg.user)
     parser.add_argument("--kind", default=cfg.kind)
+    parser.add_argument("--lifecycle-inspect", action="store_true")
+    parser.add_argument("--lifecycle-prune", action="store_true")
+    parser.add_argument("--lifecycle-print-identity", action="store_true")
     args = parser.parse_args()
     cfg.addr = args.addr
     cfg.nick = args.nick
     cfg.user = args.user
     cfg.kind = args.kind
+    if args.lifecycle_print_identity:
+        print(
+            json.dumps(
+                lifecycle.describe_current(cfg),
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if args.lifecycle_inspect or args.lifecycle_prune:
+        print(
+            json.dumps(
+                lifecycle.inspect_registry(prune=args.lifecycle_prune),
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
     # cfg is fully resolved here — install lifecycle so startup log,
     # idle TTL and parent watchdog all see the final addr/nick.
     lifecycle.startup(cfg, is_stateless_provider=session.is_stateless)
+    lifecycle.log_event("mcp_run_enter")
     try:
         mcp.run()
     except KeyboardInterrupt:
@@ -700,8 +723,18 @@ def main() -> None:
             message=str(e),
         )
         raise
+    except BaseException as e:
+        lifecycle.shutdown(
+            "base_exception",
+            type=type(e).__name__,
+            message=str(e),
+        )
+        raise
     else:
+        lifecycle.log_event("mcp_run_returned")
         lifecycle.shutdown("normal")
+    finally:
+        lifecycle.log_event("main_finally")
 
 
 if __name__ == "__main__":

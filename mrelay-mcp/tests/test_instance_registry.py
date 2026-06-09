@@ -60,7 +60,7 @@ def test_startup_registers_current_instance(monkeypatch, tmp_path):
     assert entry["elapsed_sec"] >= 0
 
     raw = json.loads((tmp_path / "instance_registry.json").read_text(encoding="utf-8"))
-    assert raw["version"] == 1
+    assert raw["version"] == 2
     assert len(raw["instances"]) == 1
     assert raw["instances"][0]["pid"] == os.getpid()
 

@@ -19,6 +19,11 @@ temp/
 **/archive/
 **/log.jsonl
 
+# MCP bridge lifecycle/runtime state
+mrelay-mcp/mrelay_mcp/instance_registry.json
+mrelay-mcp/mrelay_mcp/instance_registry.lock
+mrelay-mcp/mrelay_mcp/lifecycle_events.jsonl
+
 # Local development notes
 dev-notes/
 
